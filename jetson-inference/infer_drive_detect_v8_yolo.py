@@ -45,11 +45,13 @@ STEERING_OFFSET = 0.20
 
 DURATION_STOP = 2.0
 DURATION_SLOW = 2.0
-DURATION_SPEED_LIMIT = 7.0
-COOLDOWN_STOP = 3.0
+DURATION_SPEED_LIMIT = 7.0 
+
+TRACKER_IOU_THRES = 0.3
+TRACKER_EVICT_FRAMES = 90
 
 FACTOR_CHILD = 0.95
-FACTOR_ADULT = 1.0
+FACTOR_ADULT = 1.0 
 FACTOR_SPEED_LIMIT = 0.95
 
 MIN_AREA_PERSON = 3000
@@ -286,6 +288,92 @@ class KalmanSteering:
 
 
 # ──────────────────────────────────────────────
+# Detection Tracker
+# ──────────────────────────────────────────────
+
+
+class DetectionTracker:
+    """IoU-based tracker that assigns persistent IDs to detections across frames."""
+
+    def __init__(self, iou_threshold: float = 0.3, evict_frames: int = 90):
+        self._iou_threshold = iou_threshold
+        self._evict_frames = evict_frames
+        self._next_id = 0
+        self._tracks = {}
+
+    @staticmethod
+    def _iou(box_a: list, box_b: list) -> float:
+        ax, ay, aw, ah = box_a
+        bx, by, bw, bh = box_b
+        ax2, ay2 = ax + aw, ay + ah
+        bx2, by2 = bx + bw, by + bh
+
+        ix = max(ax, bx)
+        iy = max(ay, by)
+        ix2 = min(ax2, bx2)
+        iy2 = min(ay2, by2)
+
+        inter = max(0, ix2 - ix) * max(0, iy2 - iy)
+        if inter == 0:
+            return 0.0
+
+        union = aw * ah + bw * bh - inter
+        return inter / union if union > 0 else 0.0
+
+    def update(self, detections: list) -> list:
+        unmatched = list(range(len(detections)))
+        matched_track_ids = set()
+
+        for det_idx in list(unmatched):
+            det = detections[det_idx]
+            best_iou = 0.0
+            best_tid = None
+
+            for tid, track in self._tracks.items():
+                if tid in matched_track_ids:
+                    continue
+                if track["class"] != det["class"]:
+                    continue
+                iou = self._iou(track["box"], det["box"])
+                if iou > best_iou:
+                    best_iou = iou
+                    best_tid = tid
+
+            if best_tid is not None and best_iou >= self._iou_threshold:
+                self._tracks[best_tid]["box"] = det["box"]
+                self._tracks[best_tid]["missed"] = 0
+                det["track_id"] = best_tid
+                det["acted"] = self._tracks[best_tid]["acted"]
+                matched_track_ids.add(best_tid)
+                unmatched.remove(det_idx)
+
+        for det_idx in unmatched:
+            det = detections[det_idx]
+            tid = self._next_id
+            self._next_id += 1
+            self._tracks[tid] = {
+                "class": det["class"],
+                "box": det["box"],
+                "acted": False,
+                "missed": 0,
+            }
+            det["track_id"] = tid
+            det["acted"] = False
+
+        for tid in list(self._tracks):
+            if tid not in matched_track_ids:
+                self._tracks[tid]["missed"] += 1
+                if self._tracks[tid]["missed"] > self._evict_frames:
+                    del self._tracks[tid]
+
+        return detections
+
+    def mark_acted(self, track_id: int):
+        if track_id in self._tracks:
+            self._tracks[track_id]["acted"] = True
+
+
+# ──────────────────────────────────────────────
 # Preprocessing
 # ──────────────────────────────────────────────
 
@@ -329,6 +417,7 @@ def main_loop(stop_event: mp.Event):
     detection_ai = YoloTRT(DETECTION_ENGINE_PATH)
 
     kf = KalmanSteering(0.05, 0.2)
+    tracker = DetectionTracker(TRACKER_IOU_THRES, TRACKER_EVICT_FRAMES)
     camera = CSICamera(width=CAMERA_W, height=CAMERA_H, capture_fps=30)
     camera.running = True
 
@@ -338,7 +427,6 @@ def main_loop(stop_event: mp.Event):
     speed_limit_end_time = 0.0
     incident_end_time = 0.0
     incident_type = None
-    stop_cooldown_end_time = 0.0
 
     log.info("Waiting for camera feed...")
     while camera.value is None:
@@ -384,6 +472,7 @@ def main_loop(stop_event: mp.Event):
                 )
 
             seen_labels = [d["class"] for d in detections if d["active"]]
+            tracker.update(detections)
 
             # State machine — speed limit zone
             if "speed limit zone" in seen_labels:
@@ -399,12 +488,21 @@ def main_loop(stop_event: mp.Event):
                 log.info("Speed-limit zone expired (timeout)")
 
             # State machine — incident handling
-            if "stop_sign" in seen_labels or "stop sign" in seen_labels:
-                if incident_type != "STOP" and current_time > stop_cooldown_end_time:
+            stop_dets = [
+                d for d in detections
+                if d["class"] in ("stop_sign", "stop sign")
+                and d["active"]
+                and not d.get("acted", False)
+            ]
+            if stop_dets:
+                if incident_type != "STOP":
                     incident_type = "STOP"
                     incident_end_time = current_time + DURATION_STOP
-                    stop_cooldown_end_time = incident_end_time + COOLDOWN_STOP
-                    log.info("STOP triggered for %.1fs", DURATION_STOP)
+                    for d in stop_dets:
+                        tracker.mark_acted(d["track_id"])
+                    log.info("STOP triggered for %.1fs (track IDs: %s)",
+                             DURATION_STOP,
+                             [d["track_id"] for d in stop_dets])
             elif "child" in seen_labels:
                 if incident_type != "STOP":
                     incident_type = "CHILD"
@@ -500,4 +598,3 @@ if __name__ == "__main__":
     stop_event = mp.Event()
     signal.signal(signal.SIGINT, lambda s, f: stop_event.set())
     main_loop(stop_event)
-
