@@ -1,3 +1,3 @@
 #!/bin/bash
 
-rsync -avzP ./test_images/ jetson@192.168.0.103:/home/jetson/Documents/dev/resnet
+rsync -avzP ./yolo11_v4.engine jetson@192.168.0.103:/home/jetson/Documents/dev/resnet
