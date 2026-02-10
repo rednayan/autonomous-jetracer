@@ -1,7 +1,7 @@
 # JetRacer Autonomous Driving Stack
 
 <p align="center">
-  <video src="https://github.com/rednayan/autonomous-jetracer/raw/master/demo_video.mp4" poster="https://github.com/rednayan/autonomous-jetracer/raw/master/jetracer.jpg" autoplay loop muted controls="controls" style="max-width: 800px; border-radius: 10px;">
+  <video src="https://github.com/user-attachments/assets/856154bc-44d6-4539-b87a-99e3d1735202" autoplay loop muted controls="controls" style="max-width: 800px; border-radius: 10px;">
     Your browser does not support the video tag.
   </video>
 </p>
