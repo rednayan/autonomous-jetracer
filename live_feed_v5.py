@@ -19,8 +19,9 @@ log = logging.getLogger("dashboard")
 # Configuration
 # ──────────────────────────────────────────────
 
-JETSON_IP = "192.168.0.103"
+JETSON_IP = "192.168.3.201"
 DATA_PORT = 5555
+CONTROL_PORT = 5556  # NEW: port for sending control commands
 DEBUG_MODE = False
 
 app = Flask(__name__)
@@ -34,8 +35,13 @@ latest_telemetry = {
     "incident": "NONE",
     "fps": 0.0,
     "detections": [],
+    "is_running": False,
 }
 lock = threading.Lock()
+
+# NEW: Control socket (global)
+control_socket = None
+
 
 # ──────────────────────────────────────────────
 # ZMQ Listener
@@ -53,18 +59,26 @@ def _correct_white_balance(frame: np.ndarray) -> np.ndarray:
 
 
 def zmq_listener():
-    global latest_frame, latest_telemetry
+    global latest_frame, latest_telemetry, control_socket
 
     if DEBUG_MODE:
         log.warning("Running in DEBUG mode — using synthetic data")
         _run_debug_loop()
         return
 
-    log.info("Connecting to Jetson at %s:%d", JETSON_IP, DATA_PORT)
+    log.info("Connecting to Jetson at %s:%d (data) and :%d (control)", 
+             JETSON_IP, DATA_PORT, CONTROL_PORT)
     ctx = zmq.Context()
+    
+    # Data subscription socket
     sub = ctx.socket(zmq.SUB)
     sub.connect(f"tcp://{JETSON_IP}:{DATA_PORT}")
     sub.setsockopt(zmq.SUBSCRIBE, b"dashboard")
+    
+    # NEW: Control publishing socket
+    control_socket = ctx.socket(zmq.PUB)
+    control_socket.connect(f"tcp://{JETSON_IP}:{CONTROL_PORT}")
+    time.sleep(0.5)  # Give ZMQ time to establish connection
 
     while True:
         try:
@@ -115,6 +129,7 @@ def _run_debug_loop():
             "detections": [
                 {"class": "stop_sign", "score": 0.95, "box": [200, 150, 100, 100]}
             ],
+            "is_running": int(time.time()) % 20 > 10,
         }
         with lock:
             latest_frame = fake_frame
@@ -185,6 +200,11 @@ DASHBOARD_HTML = '''
             padding-bottom: 12px;
             border-bottom: 1px solid var(--border);
         }
+        .header-left {
+            display: flex;
+            align-items: center;
+            gap: 16px;
+        }
         .header-title {
             font-family: var(--font-mono);
             font-size: 13px;
@@ -203,6 +223,58 @@ DASHBOARD_HTML = '''
         @keyframes pulse-dot {
             0%, 100% { opacity: 1; }
             50% { opacity: 0.4; }
+        }
+
+        /* Control buttons */
+        .control-buttons {
+            display: flex;
+            gap: 8px;
+        }
+        .control-btn {
+            font-family: var(--font-mono);
+            font-size: 11px;
+            font-weight: 600;
+            letter-spacing: 0.06em;
+            text-transform: uppercase;
+            padding: 8px 20px;
+            border: 1px solid var(--border);
+            border-radius: 4px;
+            background: var(--bg-card);
+            color: var(--text-primary);
+            cursor: pointer;
+            transition: all 0.15s ease;
+        }
+        .control-btn:hover {
+            background: var(--bg-card-alt);
+            border-color: var(--text-secondary);
+        }
+        .control-btn:active {
+            transform: scale(0.96);
+        }
+        .control-btn.start {
+            border-color: rgba(74, 222, 128, 0.4);
+            color: var(--accent-green);
+        }
+        .control-btn.start:hover {
+            background: rgba(74, 222, 128, 0.08);
+            border-color: var(--accent-green);
+        }
+        .control-btn.stop {
+            border-color: rgba(239, 68, 68, 0.4);
+            color: var(--accent-red);
+        }
+        .control-btn.stop:hover {
+            background: rgba(239, 68, 68, 0.08);
+            border-color: var(--accent-red);
+        }
+        .control-btn:disabled {
+            opacity: 0.3;
+            cursor: not-allowed;
+        }
+        .control-btn:disabled:hover {
+            background: var(--bg-card);
+            border-color: var(--border);
+            transform: none;
         }
 
         /* Top row */
@@ -331,6 +403,8 @@ DASHBOARD_HTML = '''
         }
 
         /* Status colors */
+        .status-idle     { color: var(--text-dim) !important; }
+        .status-ready    { color: var(--accent-cyan) !important; }
         .status-driving  { color: var(--accent-green) !important; }
         .status-limit    { color: var(--accent-amber) !important; }
         .status-slowing  { color: var(--accent-amber) !important; }
@@ -421,8 +495,14 @@ DASHBOARD_HTML = '''
     <div class="dashboard">
 
         <div class="header">
-            <span class="header-title">Race Telemetry</span>
-            <div class="header-dot" id="connDot"></div>
+            <div class="header-left">
+                <span class="header-title">Race Telemetry</span>
+                <div class="header-dot" id="connDot"></div>
+            </div>
+            <div class="control-buttons">
+                <button class="control-btn start" id="startBtn" onclick="sendStart()">▶ Start</button>
+                <button class="control-btn stop" id="stopBtn" onclick="sendStop()">■ Stop</button>
+            </div>
         </div>
 
         <div class="top-row">
@@ -435,7 +515,7 @@ DASHBOARD_HTML = '''
                 <div class="stat-grid">
                     <div class="stat-cell">
                         <span class="stat-key">Status</span>
-                        <span class="stat-val status-driving" id="statusText">READY</span>
+                        <span class="stat-val status-idle" id="statusText">IDLE</span>
                     </div>
                     <div class="stat-cell">
                         <span class="stat-key">Mode</span>
@@ -589,6 +669,28 @@ DASHBOARD_HTML = '''
             }).join("");
         }
 
+        function sendStart() {
+            fetch("/control/start", {method: "POST"})
+                .then(function(r) { return r.json(); })
+                .then(function(d) {
+                    console.log("Start command sent:", d);
+                })
+                .catch(function(err) {
+                    console.error("Failed to send start:", err);
+                });
+        }
+
+        function sendStop() {
+            fetch("/control/stop", {method: "POST"})
+                .then(function(r) { return r.json(); })
+                .then(function(d) {
+                    console.log("Stop command sent:", d);
+                })
+                .catch(function(err) {
+                    console.error("Failed to send stop:", err);
+                });
+        }
+
         setInterval(function() {
             fetch("/data").then(function(r) { return r.json(); }).then(function(d) {
                 var now = Date.now();
@@ -608,22 +710,37 @@ DASHBOARD_HTML = '''
                 var st = document.getElementById("statusText");
                 st.className = "stat-val";
 
-                if (inc === "STOP") {
-                    st.textContent = "STOPPING";
-                    st.classList.add("status-stopping");
-                    incEl.style.color = "var(--accent-red)";
-                } else if (inc === "CHILD" || inc === "ADULT") {
-                    st.textContent = "SLOWING";
-                    st.classList.add("status-slowing");
-                    incEl.style.color = "var(--accent-amber)";
-                } else if (d.mode === "LIMIT") {
-                    st.textContent = "LIMIT";
-                    st.classList.add("status-limit");
-                    incEl.style.color = "var(--accent-amber)";
+                var isRunning = d.is_running || false;
+                var startBtn = document.getElementById("startBtn");
+                var stopBtn = document.getElementById("stopBtn");
+
+                if (!isRunning) {
+                    st.textContent = "IDLE";
+                    st.classList.add("status-idle");
+                    incEl.style.color = "var(--text-dim)";
+                    startBtn.disabled = false;
+                    stopBtn.disabled = true;
                 } else {
-                    st.textContent = "DRIVING";
-                    st.classList.add("status-driving");
-                    incEl.style.color = "var(--text-primary)";
+                    startBtn.disabled = true;
+                    stopBtn.disabled = false;
+
+                    if (inc === "STOP") {
+                        st.textContent = "STOPPING";
+                        st.classList.add("status-stopping");
+                        incEl.style.color = "var(--accent-red)";
+                    } else if (inc === "CHILD" || inc === "ADULT") {
+                        st.textContent = "SLOWING";
+                        st.classList.add("status-slowing");
+                        incEl.style.color = "var(--accent-amber)";
+                    } else if (d.mode === "LIMIT") {
+                        st.textContent = "LIMIT";
+                        st.classList.add("status-limit");
+                        incEl.style.color = "var(--accent-amber)";
+                    } else {
+                        st.textContent = "DRIVING";
+                        st.classList.add("status-driving");
+                        incEl.style.color = "var(--text-primary)";
+                    }
                 }
 
                 tsRaw.append(now, d.raw_steer || 0);
@@ -666,6 +783,29 @@ def video_feed():
 def data():
     with lock:
         return jsonify(latest_telemetry)
+
+
+# NEW: Control endpoints
+@app.route("/control/start", methods=["POST"])
+def control_start():
+    global control_socket
+    if control_socket is not None:
+        cmd = {"command": "start"}
+        control_socket.send_multipart([b"control", json.dumps(cmd).encode("utf-8")])
+        log.info("▶ START command sent to Jetson")
+        return jsonify({"status": "ok", "command": "start"})
+    return jsonify({"status": "error", "message": "Control socket not initialized"}), 500
+
+
+@app.route("/control/stop", methods=["POST"])
+def control_stop():
+    global control_socket
+    if control_socket is not None:
+        cmd = {"command": "stop"}
+        control_socket.send_multipart([b"control", json.dumps(cmd).encode("utf-8")])
+        log.info("■ STOP command sent to Jetson")
+        return jsonify({"status": "ok", "command": "stop"})
+    return jsonify({"status": "error", "message": "Control socket not initialized"}), 500
 
 
 # ──────────────────────────────────────────────

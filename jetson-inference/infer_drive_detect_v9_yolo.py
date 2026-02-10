@@ -28,6 +28,7 @@ log = logging.getLogger("racer")
 # ──────────────────────────────────────────────
 
 DATA_PORT = 5555
+CONTROL_PORT = 5556
 DRIVING_ENGINE_PATH = "./models/resnet18_merged_v3.engine"
 DETECTION_ENGINE_PATH = "./models/yolo11.engine"
 SIGN_LABELS_PATH = "labels.txt"
@@ -38,24 +39,27 @@ MODEL_INPUT_SIZE = 224
 CONF_THRES = 0.25
 IOU_THRES = 0.45
 
-MAX_THROTTLE = 0.375
-THROTTLE_GAIN = 0.375
+MAX_THROTTLE = 0.39
+THROTTLE_GAIN = 0.39
 STEERING_GAIN = -0.65
 STEERING_OFFSET = 0.20
 
 DURATION_STOP = 2.0
 DURATION_SLOW = 2.0
-DURATION_SPEED_LIMIT = 7.0 
+DURATION_SPEED_LIMIT = 5.0 
 
 TRACKER_IOU_THRES = 0.3
 TRACKER_EVICT_FRAMES = 90
 
-FACTOR_CHILD = 0.95
+FACTOR_CHILD = 0.85
 FACTOR_ADULT = 1.0 
-FACTOR_SPEED_LIMIT = 0.95
+FACTOR_SPEED_LIMIT = 0.85
 
 MIN_AREA_PERSON = 3000
 MIN_AREA_SIGN = 4000
+MIN_AREA_OVERRIDES = {
+    "end speed limit zone": 5000,
+}
 
 PERSON_CLASSES = {"child", "adult"}
 SIGN_CLASSES = {
@@ -402,8 +406,14 @@ def main_loop(stop_event: mp.Event):
     log.info("Loaded %d class labels", len(labels))
 
     ctx = zmq.Context()
+    
     pub_socket = ctx.socket(zmq.PUB)
     pub_socket.bind(f"tcp://*:{DATA_PORT}")
+    
+    control_socket = ctx.socket(zmq.SUB)
+    control_socket.bind(f"tcp://*:{CONTROL_PORT}")
+    control_socket.setsockopt(zmq.SUBSCRIBE, b"control")
+    control_socket.setsockopt(zmq.RCVTIMEO, 10)  # 10ms timeout for non-blocking
 
     car = NvidiaRacecar()
     car.throttle_gain = THROTTLE_GAIN
@@ -421,8 +431,10 @@ def main_loop(stop_event: mp.Event):
     camera = CSICamera(width=CAMERA_W, height=CAMERA_H, capture_fps=30)
     camera.running = True
 
-    log.info("System ready — entering main drive loop")
+    log.info("System ready — waiting for START command from dashboard")
 
+    is_running = False
+    
     speed_limit_active = False
     speed_limit_end_time = 0.0
     incident_end_time = 0.0
@@ -441,12 +453,29 @@ def main_loop(stop_event: mp.Event):
             last_time = loop_start
             current_time = time.time()
 
+            try:
+                _, cmd_data = control_socket.recv_multipart()
+                cmd = json.loads(cmd_data.decode("utf-8"))
+                if cmd.get("command") == "start":
+                    is_running = True
+                    speed_limit_active = False
+                    incident_type = None
+                    kf = KalmanSteering(0.05, 0.2)
+                    tracker = DetectionTracker(TRACKER_IOU_THRES, TRACKER_EVICT_FRAMES)
+                    log.info("▶ START command received — vehicle active")
+                elif cmd.get("command") == "stop":
+                    is_running = False
+                    car.throttle = 0.0
+                    car.steering = 0.0
+                    log.info("■ STOP command received — vehicle halted")
+            except zmq.Again:
+                pass
+
             frame = camera.value
             if frame is None:
                 time.sleep(0.01)
                 continue
 
-            # Detection
             yolo_results = detection_ai.infer(frame)
 
             detections = []
@@ -457,9 +486,13 @@ def main_loop(stop_event: mp.Event):
                 bw, bh = int(x2 - x1), int(y2 - y1)
                 area = bw * bh
                 active = True
-                if label_name in PERSON_CLASSES and area < MIN_AREA_PERSON:
+                min_area = MIN_AREA_OVERRIDES.get(label_name)
+                if min_area is not None:
+                    if area < min_area:
+                        active = False
+                elif label_name in PERSON_CLASSES and area < MIN_AREA_PERSON:
                     active = False
-                if label_name in SIGN_CLASSES and area < MIN_AREA_SIGN:
+                elif label_name in SIGN_CLASSES and area < MIN_AREA_SIGN:
                     active = False
                 detections.append(
                     {
@@ -474,79 +507,82 @@ def main_loop(stop_event: mp.Event):
             seen_labels = [d["class"] for d in detections if d["active"]]
             tracker.update(detections)
 
-            # State machine — speed limit zone
-            if "speed limit zone" in seen_labels:
-                speed_limit_active = True
-                speed_limit_end_time = current_time + DURATION_SPEED_LIMIT
-                log.info("Entering speed-limit zone (latched)")
-            elif "end speed limit zone" in seen_labels:
-                speed_limit_active = False
-                log.info("Leaving speed-limit zone (latched)")
+            # Only process driving logic if running
+            if is_running:
+                # State machine — speed limit zone
+                if "speed limit zone" in seen_labels:
+                    speed_limit_active = True
+                    speed_limit_end_time = current_time + DURATION_SPEED_LIMIT
+                    log.info("Entering speed-limit zone (latched)")
+                elif "end speed limit zone" in seen_labels:
+                    speed_limit_active = False
+                    log.info("Leaving speed-limit zone (latched)")
 
-            if speed_limit_active and current_time > speed_limit_end_time:
-                speed_limit_active = False
-                log.info("Speed-limit zone expired (timeout)")
+                if speed_limit_active and current_time > speed_limit_end_time:
+                    speed_limit_active = False
+                    log.info("Speed-limit zone expired (timeout)")
 
-            # State machine — incident handling
-            stop_dets = [
-                d for d in detections
-                if d["class"] in ("stop_sign", "stop sign")
-                and d["active"]
-                and not d.get("acted", False)
-            ]
-            if stop_dets:
-                if incident_type != "STOP":
-                    incident_type = "STOP"
-                    incident_end_time = current_time + DURATION_STOP
-                    for d in stop_dets:
-                        tracker.mark_acted(d["track_id"])
-                    log.info("STOP triggered for %.1fs (track IDs: %s)",
-                             DURATION_STOP,
-                             [d["track_id"] for d in stop_dets])
-            elif "child" in seen_labels:
-                if incident_type != "STOP":
-                    incident_type = "CHILD"
-                    incident_end_time = current_time + DURATION_SLOW
-            elif "adult" in seen_labels:
-                if incident_type not in ["STOP", "CHILD"]:
-                    incident_type = "ADULT"
-                    incident_end_time = current_time + DURATION_SLOW
+                # State machine — incident handling
+                stop_dets = [
+                    d for d in detections
+                    if d["class"] in ("stop_sign", "stop sign")
+                    and d["active"]
+                    and not d.get("acted", False)
+                ]
+                if stop_dets:
+                    if incident_type != "STOP":
+                        incident_type = "STOP"
+                        incident_end_time = current_time + DURATION_STOP
+                        for d in stop_dets:
+                            tracker.mark_acted(d["track_id"])
+                        log.info("STOP triggered for %.1fs (track IDs: %s)",
+                                 DURATION_STOP,
+                                 [d["track_id"] for d in stop_dets])
+                elif "child" in seen_labels:
+                    if incident_type != "STOP":
+                        incident_type = "CHILD"
+                        incident_end_time = current_time + DURATION_SLOW
+                elif "adult" in seen_labels:
+                    if incident_type not in ["STOP", "CHILD"]:
+                        incident_type = "ADULT"
+                        incident_end_time = current_time + DURATION_SLOW
 
-            # Driving control
-            drive_input = preprocess_driving(frame)
-            drive_out = driving_ai.infer(drive_input)[0]
-            raw_steer = float(drive_out[0])
+                # Driving control
+                drive_input = preprocess_driving(frame)
+                drive_out = driving_ai.infer(drive_input)[0]
+                raw_steer = float(drive_out[0])
 
-            kf.predict(dt)
-            smooth_steer = kf.update(raw_steer)
-            car.steering = np.clip(smooth_steer, -1.0, 1.0)
+                kf.predict(dt)
+                smooth_steer = kf.update(raw_steer)
+                car.steering = np.clip(smooth_steer, -1.0, 1.0)
 
-            # Throttle
-            target_throttle = MAX_THROTTLE
-            if speed_limit_active:
-                target_throttle *= FACTOR_SPEED_LIMIT
+                # Throttle
+                target_throttle = MAX_THROTTLE
+                if speed_limit_active:
+                    target_throttle *= FACTOR_SPEED_LIMIT
 
-            is_incident_active = current_time < incident_end_time
+                is_incident_active = current_time < incident_end_time
 
-            if is_incident_active:
-                if incident_type == "STOP":
-                    target_throttle = 0.0
-                elif incident_type == "CHILD":
-                    target_throttle *= FACTOR_CHILD
-                    log.debug(
-                        "Slowing (child) — %.1fs remaining",
-                        incident_end_time - current_time,
-                    )
-                elif incident_type == "ADULT":
-                    target_throttle *= FACTOR_ADULT
-                    log.debug(
-                        "Slowing (adult) — %.1fs remaining",
-                        incident_end_time - current_time,
-                    )
+                if is_incident_active:
+                    if incident_type == "STOP":
+                        target_throttle = 0.0
+                    elif incident_type == "CHILD":
+                        target_throttle *= FACTOR_CHILD
+                    elif incident_type == "ADULT":
+                        target_throttle *= FACTOR_ADULT
+                else:
+                    incident_type = None
+
+                car.throttle = target_throttle
             else:
-                incident_type = None
-
-            car.throttle = target_throttle
+                # When not running, keep car stopped but still compute steering for display
+                car.throttle = 0.0
+                car.steering = 0.0
+                
+                drive_input = preprocess_driving(frame)
+                drive_out = driving_ai.infer(drive_input)[0]
+                raw_steer = float(drive_out[0])
+                smooth_steer = raw_steer  # Don't use Kalman when stopped
 
             # Telemetry
             vis_frame = frame.copy()
@@ -578,8 +614,9 @@ def main_loop(stop_event: mp.Event):
                 "throttle": car.throttle,
                 "fps": 1.0 / (time.perf_counter() - loop_start),
                 "mode": "LIMIT" if speed_limit_active else "NORMAL",
-                "incident": incident_type if is_incident_active else "NONE",
+                "incident": incident_type if is_running and incident_type else "NONE",
                 "detections": detections,
+                "is_running": is_running,
             }
             pub_socket.send_multipart(
                 [b"dashboard", json.dumps(telemetry).encode("utf-8"), jpg.tobytes()]
