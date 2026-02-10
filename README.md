@@ -1,4 +1,4 @@
-# JetRacer Autonomous Driving Stack
+# JetRacer Autonomous Driving
 
 <p align="center">
   <video src="https://github.com/user-attachments/assets/856154bc-44d6-4539-b87a-99e3d1735202" autoplay loop muted controls="controls" style="max-width: 800px; border-radius: 10px;">
