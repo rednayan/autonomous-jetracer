@@ -1,5 +1,11 @@
 # JetRacer Autonomous Driving Stack
 
+<p align="center">
+  <video src="https://github.com/rednayan/autonomous-jetracer/raw/master/demo_video.mp4" poster="https://github.com/rednayan/autonomous-jetracer/raw/master/jetracer.jpg" autoplay loop muted controls="controls" style="max-width: 800px; border-radius: 10px;">
+    Your browser does not support the video tag.
+  </video>
+</p>
+
 Autonomous racecar platform running on NVIDIA Jetson Nano. Combines a ResNet-18 steering model with YOLOv11 or MobileNet-V1 SSD object detection to navigate a track while reacting to traffic signs, pedestrians, and speed limit zones. A companion Flask dashboard provides real-time telemetry over ZMQ.
 
 ---
